@@ -87,6 +87,20 @@ h1 { margin: 0; font-size: 20px; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .act.primary { color: #0b1512; } }
 .act:disabled { opacity: .5; cursor: default; }
 .more { width: 100%; margin-top: 4px; min-height: 40px; }
+.wstat { margin-top: 8px; padding: 6px 8px; border-radius: 6px; background: var(--pending-bg); color: var(--text); font-size: 12.5px; overflow-wrap: anywhere; }
+.wstat b { color: var(--pending); }
+.thread { margin-top: 8px; }
+.thread summary { cursor: pointer; color: var(--accent); font-size: 12px; padding: 6px 0; }
+.msg { margin: 6px 0; padding: 6px 8px; border-radius: 6px; font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--chip); }
+.msg.duong { background: var(--btn); margin-left: 24px; }
+.msg.claude { background: var(--pending-bg); margin-right: 24px; }
+.msg.bot { background: var(--news-bg); color: var(--news); }
+.msg .who { display: block; font-size: 10.5px; color: var(--muted); margin-bottom: 2px; }
+.compose { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.compose label { font-size: 11.5px; color: var(--muted); }
+.compose textarea { width: 100%; min-height: 64px; resize: vertical; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.compose.draft textarea { border-color: var(--pending); min-height: 96px; }
 .empty { color: var(--muted); font-size: 12px; padding: 8px 4px; }
 .setup { max-width: 520px; margin: 40px auto; padding: 0 16px; }
 .setup .box { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
@@ -173,18 +187,27 @@ const REFRESH_MS = 2 * 60 * 1000;
 const STALE_MS = 2 * 3600 * 1000;
 const COLS = [
   { id: "todo", name: "To do", short: "To do", hint: () => "Needs action" },
+  { id: "progress", name: "In progress", short: "Working", hint: () => "Claude is on it" },
+  { id: "needs", name: "Needs you", short: "Needs you", hint: () => "A reply to approve or a question" },
+  { id: "waiting", name: "Waiting", short: "Waiting", hint: () => "Waiting on someone else" },
+  { id: "ready", name: "Ready to close", short: "Ready", hint: () => "Claude thinks it's finished · tap Done to confirm" },
   { id: "fyi", name: "FYI", short: "FYI", hint: () => "Info only" },
   { id: "auto", name: "Auto-done", short: "Auto", hint: d => `Closed by the bot · last ${d} days` },
   { id: "done", name: "Done", short: "Done", hint: d => `Last ${d} days` },
   { id: "skipped", name: "Skipped", short: "Skipped", hint: () => "" },
 ];
-const TARGET = { done: "done", skip: "skipped", reopen: "todo" };
-const ACTION_LABEL = { done: "done", skip: "skip", reopen: "reopen" };
+const TARGET = { done: "done", skip: "skipped", reopen: "todo", ask: "progress", send: "progress" };
+const ACTION_LABEL = { done: "done", skip: "skip", reopen: "reopen", ask: "message to Claude", send: "reply" };
+const WORK_COL = { queued: "progress", running: "progress", needs_you: "needs", waiting: "waiting", ready: "ready" };
+const CLOSED_COLS = ["done", "auto", "skipped"];
 const SRC = { slack: "Slack", bitbucket: "Bitbucket", hub: "Hub", asana: "Asana", phoenix: "Phoenix", merge_request: "Merge" };
 const PRI = { urgent: 0, normal: 1, low: 2 };
 const PAGE = 40;
 
 const state = { q: "", project: "", priority: "", sources: new Set(), shown: {}, tab: "todo" };
+const typed = new Map();      // composer text per card+box, kept across re-renders
+const openBoxes = new Set();  // "id" -> composer open; "t:id" -> thread open
+let renderDeferred = false;
 let DATA = null;          // last good board.json
 let filePending = new Map(); // id -> {action, at}  from actions/ files on the server
 const localPending = new Map(); // id -> {action, at, inflight}  clicks made in this tab
@@ -397,21 +420,24 @@ function effectiveCol(c) {
   return p ? TARGET[p.action] : c.col;
 }
 
-async function act(c, action) {
+async function act(c, action, text) {
   if (localPending.get(c.id)?.inflight) return;
   const at = new Date().toISOString();
   const prev = localPending.get(c.id);
   localPending.set(c.id, { action, at, inflight: true });
-  renderAll();
+  renderAll(true);
   const name = `${Date.now()}-${rand6()}.json`;
-  const payload = JSON.stringify({ id: c.id, action, at });
+  const payload = JSON.stringify(text ? { id: c.id, action, at, text } : { id: c.id, action, at });
   try {
     await gh(`actions/${name}`, {
       method: "PUT",
       body: JSON.stringify({ message: `board: ${action} ${c.id}`, content: b64utf8(payload), branch: BRANCH }),
     });
     localPending.set(c.id, { action, at, inflight: false });
-    toast(`Marked ${ACTION_LABEL[action]} · the bot applies it in a few minutes`);
+    typed.delete(`${c.id}|msg`); typed.delete(`${c.id}|draft`); openBoxes.delete(c.id);
+    toast(action === "ask" || action === "send"
+      ? `Sent ${ACTION_LABEL[action]} · picked up in a few minutes`
+      : `Marked ${ACTION_LABEL[action]} · the bot applies it in a few minutes`);
   } catch (e) {
     if (prev) localPending.set(c.id, prev); else localPending.delete(c.id);
     const why = e.status === 401 ? "token rejected" : e.status === 0 ? "network error"
@@ -419,7 +445,7 @@ async function act(c, action) {
     toast(`Could not save "${ACTION_LABEL[action]}" (${why}). Card moved back.`, true);
     if (e.status === 401) setError(e);
   }
-  renderAll();
+  renderAll(true);
 }
 
 /* ---------- filters ---------- */
@@ -509,18 +535,86 @@ function card(c) {
   const app = safeHref(c.app, ["slack:"]);
   if (app) { const l = el("a", null, "Open in Slack"); l.href = app; l.target = "_blank"; l.rel = "noopener noreferrer"; f.append(l); }
   d.append(f);
-  const acts = el("div", "acts");
+  const w = c.work || null;
   const busy = !!(p && p.inflight);
-  const mk = (text, action, primary) => {
+  if (w && w.status && !CLOSED_COLS.includes(col)) d.append(workStatus(w));
+  if (w && w.thread && w.thread.length) d.append(thread(c, w));
+  if (!busy && col === "needs" && w && w.draft && w.canSend) {
+    d.append(composer(c, "draft", "Reply drafted for Slack — edit if needed, then send", w.draft, "Send reply", "send", true));
+  }
+  if (!busy && openBoxes.has(c.id)) {
+    const first = !w || !w.thread || !w.thread.length;
+    d.append(composer(c, "msg", first ? "Note for Claude (optional)" : "Message to Claude", "",
+      first ? "Ask Claude" : "Send", "ask", false));
+  }
+  const acts = el("div", "acts");
+  const mk = (text, onclick, primary) => {
     const b = el("button", "act" + (primary ? " primary" : ""), text);
-    b.type = "button"; b.disabled = busy; b.dataset.action = action;
-    b.onclick = () => act(c, action);
+    b.type = "button"; b.disabled = busy;
+    b.onclick = onclick;
     acts.append(b);
   };
-  if (col === "todo" || col === "fyi") { mk("Done", "done", true); mk("Skip", "skip", false); }
-  else mk("Reopen", "reopen", false);
+  const toggle = () => { openBoxes.has(c.id) ? openBoxes.delete(c.id) : openBoxes.add(c.id); renderAll(true); };
+  const talkLabel = w && w.thread && w.thread.length ? "Message" : "Ask Claude";
+  if (CLOSED_COLS.includes(col)) {
+    mk("Reopen", () => act(c, "reopen"), false);
+    mk(talkLabel, toggle, false);
+  } else {
+    if (col === "ready") mk("Done", () => act(c, "done"), true);
+    if (col === "todo" || col === "fyi") mk(talkLabel, toggle, true);
+    else if (!openBoxes.has(c.id)) mk(talkLabel, toggle, false);
+    if (col !== "ready") mk("Done", () => act(c, "done"), false);
+    mk("Skip", () => act(c, "skip"), false);
+  }
   d.append(acts);
   return d;
+}
+
+function workStatus(w) {
+  const label = { queued: "Queued for Claude", running: "Claude is working", needs_you: "Needs you",
+    waiting: "Waiting", ready: "Ready to close" }[w.status] || w.status;
+  const box = el("div", "wstat");
+  box.append(el("b", null, label));
+  const extra = w.status === "running" && w.started ? ` · started ${ago(w.started)}`
+    : w.sending ? " · sending your reply" : "";
+  if (extra) box.append(document.createTextNode(extra));
+  if (w.summary && w.status !== "running" && w.status !== "queued") box.append(document.createTextNode(` — ${w.summary}`));
+  return box;
+}
+
+function thread(c, w) {
+  const det = el("details", "thread");
+  det.open = openBoxes.has(`t:${c.id}`);
+  det.ontoggle = () => { det.open ? openBoxes.add(`t:${c.id}`) : openBoxes.delete(`t:${c.id}`); };
+  det.append(el("summary", null, `Thread (${w.thread.length})`));
+  const WHO = { duong: "You", claude: "Claude", bot: "Bot" };
+  for (const m of w.thread) {
+    const kind = WHO[m.from] ? m.from : "bot";
+    const box = el("div", `msg ${kind}`);
+    box.append(el("span", "who", `${WHO[kind]} · ${ago(m.at)}`), document.createTextNode(m.text || ""));
+    det.append(box);
+  }
+  return det;
+}
+
+function composer(c, key, label, initial, button, action, isDraft) {
+  const box = el("div", "compose" + (isDraft ? " draft" : ""));
+  const id = `cmp-${key}-${c.id.replace(/[^a-zA-Z0-9]/g, "_")}`;
+  const lab = el("label", null, label); lab.htmlFor = id;
+  const ta = el("textarea"); ta.id = id;
+  const k = `${c.id}|${key}`;
+  ta.value = typed.has(k) ? typed.get(k) : initial;
+  ta.oninput = () => typed.set(k, ta.value);
+  const row = el("div", "acts");
+  const send = el("button", "act primary", button); send.type = "button";
+  send.onclick = () => {
+    const text = ta.value.trim();
+    if (action === "send" && !text) { toast("The reply is empty.", true); return; }
+    act(c, action, text);
+  };
+  row.append(send);
+  box.append(lab, ta, row);
+  return box;
 }
 
 function sortKey(col) {
@@ -570,7 +664,17 @@ function render() {
     board.append(box);
   }
 }
-function renderAll() { updateStamp(); rebuildFilterOptions(); render(); }
+function renderAll(force) {
+  // A background refresh must not wipe what is being typed or steal focus.
+  const a = document.activeElement;
+  if (!force && a && a.tagName === "TEXTAREA" && $("board").contains(a)) { renderDeferred = true; updateStamp(); return; }
+  renderDeferred = false;
+  updateStamp(); rebuildFilterOptions(); render();
+}
+$("board").addEventListener("focusout", () => setTimeout(() => {
+  const a = document.activeElement;
+  if (renderDeferred && !(a && a.tagName === "TEXTAREA" && $("board").contains(a))) renderAll();
+}, 0));
 
 /* ---------- refresh loop ---------- */
 $("refresh").onclick = () => load();
