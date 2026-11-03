@@ -620,7 +620,8 @@ function card(c) {
   if (c.reason) d.append(el("div", "reason", c.reason));
   if (c.news) d.append(el("span", "news", `🔔 ${c.news}`));
   const f = el("div", "foot");
-  f.append(el("span", null, c.closed ? `closed ${ago(c.closed)}` : c.seen ? `seen ${ago(c.seen)}` : ""));
+  const quiet = c.touched || c.seen;
+  f.append(el("span", null, c.closed ? `closed ${ago(c.closed)}` : quiet ? `untouched ${ago(quiet).replace(" ago", "")}` : ""));
   const app = safeHref(c.app, ["slack:"]);
   if (app) { const l = el("a", null, "Open in Slack"); l.href = app; l.target = "_blank"; l.rel = "noopener noreferrer"; f.append(l); }
   d.append(f);
@@ -709,7 +710,8 @@ function composer(c, key, label, initial, button, action, isDraft) {
 function sortKey(col) {
   const t = x => new Date(x).getTime() || 0;
   return col === "todo" || col === "fyi"
-    ? (a, b) => (PRI[a.priority] ?? 1) - (PRI[b.priority] ?? 1) || (b.news ? 1 : 0) - (a.news ? 1 : 0) || t(b.seen) - t(a.seen)
+    // Longest untouched first: what has sat the longest is what gets forgotten.
+    ? (a, b) => t(a.touched || a.seen) - t(b.touched || b.seen) || (PRI[a.priority] ?? 1) - (PRI[b.priority] ?? 1)
     : (a, b) => t(b.closed || b.seen) - t(a.closed || a.seen);
 }
 
